@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"database/sql"
 	"fmt"
 	"log"
@@ -444,6 +443,3 @@ func ParseSyncedLyrics(s string) ([]SyncedLine, error) {
 	}
 	return out, nil
 }
-
-// context cancellation not strictly needed yet but placeholder for future streaming
-var _ = context.Background
