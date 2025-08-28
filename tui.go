@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/charmbracelet/bubbles/progress"
+	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
@@ -20,6 +21,7 @@ type model struct {
 	lyric       *Lyric
 	synced      []SyncedLine // ordered by Seconds ascending
 	progress    progress.Model
+	viewport    viewport.Model
 	err         error
 	lyricCache  map[string]*Lyric
 	syncedCache map[string][]SyncedLine
@@ -28,9 +30,11 @@ type model struct {
 func newModel(db *sql.DB) model {
 	p := progress.New(progress.WithDefaultGradient())
 	p.Width = 60
+	vp := viewport.New(80, 20) // initial size, will be updated on window resize
 	return model{
 		db:          db,
 		progress:    p,
+		viewport:    vp,
 		lyricCache:  make(map[string]*Lyric),
 		syncedCache: make(map[string][]SyncedLine),
 	}
@@ -90,10 +94,33 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if l, ok := m.lyricCache[key]; ok {
 				m.lyric = l
 				m.synced = m.syncedCache[key]
-				return m, nil
+				// Set up viewport based on lyric type
+				newModel := m
+				if m.lyric != nil && m.lyric.SyncedLyrics.Valid {
+					newModel.viewport.SetContent("")
+				} else if m.lyric != nil && m.lyric.PlainLyrics.Valid {
+					lines := strings.Split(m.lyric.PlainLyrics.String, "\n")
+					out := make([]string, len(lines))
+					for i, l := range lines {
+						if i == 0 {
+							out[i] = lyricCurrentStyle.Render(l)
+						} else {
+							out[i] = lyricUpcomingStyle.Render(l)
+						}
+					}
+					content := strings.Join(out, "\n")
+					newModel.viewport.SetContent(content)
+				} else {
+					newModel.viewport.SetContent("")
+				}
+				return newModel, nil
 			}
-			return m, fetchLyricCmd(m.db, m.info.Artist, m.info.Title, m.info.Duration)
+			// Clear viewport content
+			newModel := m
+			newModel.viewport.SetContent("")
+			return newModel, fetchLyricCmd(m.db, m.info.Artist, m.info.Title, m.info.Duration)
 		}
+		return m, nil
 	case lyricMsg:
 		m.lyric = (*Lyric)(msg)
 		if m.lyric != nil && m.lyric.SyncedLyrics.Valid {
@@ -113,15 +140,63 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.lyric != nil {
 				m.lyricCache[key] = m.lyric
 			}
-		} else if m.lyric != nil { // plain lyrics only
+			// Clear viewport content for synced lyrics
+			newModel := m
+			newModel.viewport.SetContent("")
+			return newModel, nil
+		} else if m.lyric != nil && m.lyric.PlainLyrics.Valid { // plain lyrics only
 			key := cacheKey(m.info.Artist, m.info.Title)
 			m.lyricCache[key] = m.lyric
+			// Create a new model with updated viewport content
+			newModel := m
+			lines := strings.Split(m.lyric.PlainLyrics.String, "\n")
+			out := make([]string, len(lines))
+			for i, l := range lines {
+				if i == 0 {
+					out[i] = lyricCurrentStyle.Render(l)
+				} else {
+					out[i] = lyricUpcomingStyle.Render(l)
+				}
+			}
+			content := strings.Join(out, "\n")
+			newModel.viewport.SetContent(content)
+			return newModel, nil
+		} else {
+			// No lyrics at all
+			newModel := m
+			newModel.viewport.SetContent("")
+			return newModel, nil
 		}
 	case errMsg:
 		m.err = msg.err
+	case tea.WindowSizeMsg:
+		newModel := m
+		newModel.progress.Width = msg.Width - 4
+		newModel.viewport.Width = msg.Width
+		newModel.viewport.Height = msg.Height - 4 // leave space for metadata, progress bar, and timestamp
+		return newModel, nil
 	case tea.KeyMsg:
 		if msg.Type == tea.KeyCtrlC || msg.String() == "q" {
 			return m, tea.Quit
+		}
+		// Handle scrolling for plain lyrics
+		if len(m.synced) == 0 && m.lyric != nil && m.lyric.PlainLyrics.Valid {
+			newModel := m
+			switch msg.String() {
+			case "up", "k":
+				newModel.viewport.ScrollUp(1)
+			case "down", "j":
+				newModel.viewport.ScrollDown(1)
+			case "pgup":
+				newModel.viewport.HalfPageUp()
+			case "pgdown":
+				newModel.viewport.HalfPageDown()
+			case "home":
+				newModel.viewport.GotoTop()
+			case "end":
+				newModel.viewport.GotoBottom()
+			}
+			return newModel, nil
 		}
 	}
 	return m, nil
@@ -158,21 +233,13 @@ func (m model) currentLyricIndex() (int, bool) {
 // lyricWindow returns a window of lines around current (3 before, 3 after) formatted.
 func (m model) lyricWindow() string {
 	if len(m.synced) == 0 {
-		// Plain lyrics fallback
+		// Plain lyrics fallback - use viewport for scrolling
 		if m.lyric != nil && m.lyric.PlainLyrics.Valid {
-			lines := strings.Split(m.lyric.PlainLyrics.String, "\n")
-			out := make([]string, len(lines))
-			for i, l := range lines {
-				if i == 0 {
-					out[i] = lyricCurrentStyle.Render(l)
-				} else {
-					out[i] = lyricUpcomingStyle.Render(l)
-				}
-			}
-			return strings.Join(out, "\n")
+			return m.viewport.View()
 		}
 		return ""
 	}
+	// Synced lyrics - return formatted lines
 	idx, ok := m.currentLyricIndex()
 	if !ok { // before first line
 		first := 0
